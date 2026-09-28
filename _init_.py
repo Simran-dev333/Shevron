@@ -1,8 +1,5 @@
-"""Apstra API client integration."""
-
-from urllib.parse import urlparse
-
 import requests
+from urllib.parse import urlparse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -11,12 +8,31 @@ from nautobot.extras.choices import (
     SecretsGroupSecretTypeChoices,
 )
 
+class APIClient:
+    """
+     Apstra API client using UID token-based authentication.
 
-class ApstraAPIClient:
-    """Client for interacting with the Apstra controller API."""
+    This client:
+    - Authenticates against  Apstra (MC/MM)
+    - Retrieves a UID session token via login
+    - Uses the token for all subsequent API calls
+    - Supports command execution (CLI-equivalent via API)
+    - Retrieves device inventory and switch details
+
+    Key Characteristics:
+    - Uses HTTPS API (no SSH/CLI)
+    - Stateless requests with UID query parameter
+    - Handles -specific response formats
+    """
 
     def __init__(self, controller, job_or_logger):
-        """Initialize the Apstra API client."""
+        """
+        Initialize API client.
+
+        Args:
+            controller: Nautobot controller object containing external integration config
+            job_or_logger: Nautobot Job instance or logger object
+        """
         self.logger = (
             job_or_logger.logger
             if hasattr(job_or_logger, "logger")
@@ -24,6 +40,7 @@ class ApstraAPIClient:
         )
 
         secrets = controller.external_integration.secrets_group
+
         self.username = secrets.get_secret_value(
             SecretsGroupAccessTypeChoices.TYPE_HTTP,
             SecretsGroupSecretTypeChoices.TYPE_USERNAME,
@@ -38,100 +55,232 @@ class ApstraAPIClient:
             raw_url = f"https://{raw_url}"
 
         parsed = urlparse(raw_url)
-        self.base_url = (
-            f"{parsed.scheme}://{parsed.netloc}"
-            if parsed.netloc
-            else raw_url.rstrip("/")
-        )
+
+        self.base_url = f"https://{parsed.hostname}"
 
         self.session = requests.Session()
         retries = Retry(
             total=3,
             backoff_factor=1,
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["GET", "POST"],
+            status_forcelist=[500, 502, 503, 504]
         )
         self.session.mount("https://", HTTPAdapter(max_retries=retries))
 
         self.timeout = 60
-        self.token = None
+
+        self.uid = None
 
     def _handle_response(self, response):
-        """Validate and parse an Apstra API response."""
-        response.raise_for_status()
+        """
+        Validate and parse  API response.
+
+        Args:
+            response: requests.Response object
+
+        Returns:
+            Parsed response data (can be list, dict, or string)
+
+        Raises:
+            Exception: If API returns error or invalid response
+        """
+        if response.status_code != 200:
+            raise Exception(f"API ERROR {response.status_code}: {response.text}")
 
         try:
-            return response.json()
-        except ValueError as exc:
-            raise ValueError(
-                f"Unable to parse Apstra response: {exc}"
-            ) from exc
+            data = response.json()
+        except Exception:
+            raise Exception(f"Invalid JSON response: {response.text}")
 
-    def get(self, path):
-        """Send a GET request to the Apstra API."""
-        url = f"{self.base_url}{path}"
-        self.logger.debug("GET %s", url)
+        if data.get("_global_result", {}).get("status") == 1:
+            raise Exception(f"API ERROR: {data}")
 
-        response = self.session.get(
-            url,
-            verify=False,
-            timeout=self.timeout,
-        )
-        return self._handle_response(response)
+        return data.get("_data") or data.get("output") or data.get("result")
 
     def login(self):
-        """Authenticate with the Apstra controller and store the API token."""
+        """
+        Authenticate with  Apstra.
+
+        Performs:
+        - GET request with username/password
+        - Extracts UID token from response
+        - Stores token for subsequent API usage
+
+        Raises:
+            Exception: If authentication fails or UID is missing
+        """
         url = f"{self.base_url}/api/user/login"
-        payload = {
+
+        params = {
             "username": self.username,
             "password": self.password,
         }
 
-        self.logger.info("Authenticating to Apstra Controller")
-        response = self.session.post(
+        self.logger.debug("LOGIN URL: %s", url)
+
+        r = self.session.post(
             url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
+            json=params,
             verify=False,
             timeout=self.timeout,
         )
-        response.raise_for_status()
 
-        data = response.json()
-        self.token = data.get("token")
+        if r.status_code not in [200, 201]:
+            raise Exception(f"Login failed: {r.text}")
 
-        if not self.token:
-            raise ValueError(f"Authentication token missing: {data}")
+        data = r.json()
 
-        self.session.headers.update({"AuthToken": self.token})
-        self.logger.info("Authentication successful")
+        self.uid = data.get("token")
+
+        if not self.uid:
+           raise Exception(f"Login failed: token missing -> {r.text}")
+
+        self.logger.info("✅ LOGIN SUCCESS | UID acquired")
 
     def get_systems(self):
-        """Return the Apstra device inventory."""
-        return self.get("/api/systems")
+        url = f"{self.base_url}/api/systems"
 
-    def get_blueprints(self):
-        """Return the Apstra blueprint inventory."""
-        return self.get("/api/blueprints")
+        headers = {
+            "AuthToken": self.uid
+        }
+
+        r = self.session.get(
+            url,
+            headers=headers,
+            verify=False,
+            timeout=self.timeout,
+        )
+
+        return r.json()
 
     def get_nodes(self, blueprint_id):
-        """Return nodes for the specified Apstra blueprint."""
-        return self.get(f"/api/blueprints/{blueprint_id}/nodes")
+        url = f"{self.base_url}/api/blueprints/{blueprint_id}/nodes"
+
+        headers = {
+            "AuthToken": self.uid
+        }
+
+        r = self.session.get(
+            url,
+            headers=headers,
+            verify=False,
+            timeout=self.timeout,
+        )
+
+        return r.json()
 
     def get_cabling_map(self, blueprint_id):
-        """Return the cabling map for the specified blueprint."""
-        return self.get(f"/api/blueprints/{blueprint_id}/cabling-map")
+        url = f"{self.base_url}/api/blueprints/{blueprint_id}/cabling-map"
 
-    def test_connection(self):
-        """Test Apstra connectivity and blueprint access."""
+        headers = {
+            "AuthToken": self.uid
+        }
+
+        r = self.session.get(
+            url,
+            headers=headers,
+            verify=False,
+            timeout=self.timeout,
+        )
+
+        return r.json()
+
+    def logout(self):
+        """
+        Logout from  Apstra session.
+
+        Uses UID token to invalidate session.
+        Safe to call even if logout fails.
+        """
         try:
-            self.login()
-            blueprints = self.get_blueprints()
-            self.logger.info(
-                "Retrieved %s blueprints",
-                len(blueprints.get("items", [])),
+            url = f"{self.base_url}/v1/api/logout"
+
+            params = {"UID": self.uid}
+
+            self.session.get(
+                url,
+                params=params,
+                verify=False,
+                timeout=self.timeout
             )
-            return True
+
+            self.logger.debug("LOGOUT successful")
+
         except Exception as exc:
-            self.logger.error("Apstra connectivity test failed: %s", exc)
-            return False
+            self.logger.warning("Logout failed: %s", exc)
+
+    def run_command(self, ip, command):
+        """
+        Execute CLI-equivalent command via  API.
+
+        Args:
+            ip (str): Device IP address
+            command (str): CLI command to execute
+
+        Returns:
+            Parsed API response (various formats: list/dict/string)
+
+        Example:
+            run_command("10.1.1.1", "show inventory")
+        """
+        url = f"{self.base_url}/v1/configuration/showcommand"
+
+        params = {
+            "UID": self.uid,
+            "command": command,
+            "device_ip": ip,
+        }
+
+        self.logger.debug("CMD | %s | %s", ip, command)
+
+        r = self.session.get(
+            url,
+            params=params,
+            verify=False,
+            timeout=self.timeout,
+        )
+
+        return self._handle_response(r)
+
+    def list_devices(self):
+        """
+        Retrieve all switches/devices from Apstra.
+
+        Uses:
+            show switches API command
+
+        Returns:
+            list[dict]: List of devices with fields:
+                - IP Address
+                - Name
+                - Model
+                - Version
+                - Status
+
+        Notes:
+            - Parses structured JSON ("All Switches")
+            - No CLI parsing required
+        """
+        url = f"{self.base_url}/v1/configuration/showcommand"
+
+        params = {
+            "UID": self.uid,
+            "command": "show switches",
+        }
+
+        self.logger.debug("CMD | show switches")
+
+        r = self.session.get(
+            url,
+            params=params,
+            verify=False,
+            timeout=self.timeout,
+        )
+
+        try:
+            data = r.json()
+        except Exception:
+            raise Exception(f"Invalid JSON: {r.text}")
+
+        switches = data.get("All Switches", [])
+
+        devices = []
